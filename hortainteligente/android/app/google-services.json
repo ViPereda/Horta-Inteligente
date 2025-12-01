@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "726991202664",
+    "project_id": "hortainteligente-8d7af",
+    "storage_bucket": "hortainteligente-8d7af.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:726991202664:android:f69f764f6e1e06db304edd",
+        "android_client_info": {
+          "package_name": "com.example.hortainteligente"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD9hlnvx9zsbSlVtoKXA_P5JwK3B5QT9WY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

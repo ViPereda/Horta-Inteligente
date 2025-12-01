@@ -1,40 +1,46 @@
 import 'dart:io';
 import 'dart:async';
-import 'dart:math'; // Para gerar dados falsos de histórico
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart'; // Para formatar datas
-import 'package:fl_chart/fl_chart.dart'; // Para gráficos de histórico
+import 'package:intl/intl.dart';
+import 'package:fl_chart/fl_chart.dart';
 import 'package:mqtt_client/mqtt_client.dart';
 import 'package:mqtt_client/mqtt_server_client.dart';
 import 'package:syncfusion_flutter_gauges/gauges.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 
 // CONFIGURAÇÕES MQTT
 const String mqttBroker = 'broker.hivemq.com';
 const String topicSolo = 'ifsp-grupo5/horta/umidade_solo';
 const String topicLuz = 'ifsp-grupo5/horta/luminosidade';
-const String uniqueId = 'App_Horta_Final_V2';
+const String uniqueId = 'App_Horta_Final_Production_V4';
 
-// VARIÁVEIS GLOBAIS DE ESTADO (Simulando um Banco de Dados Local)
-// Limites de Alerta
+// CONFIGURAÇÕES DE NOTIFICAÇÃO
+const int intervaloNotificacaoSegundos = 10;
+
+// ESTADO GLOBAL
 double limiteUmidade = 60.0;
 double limiteLuz = 30.0;
-
-// Histórico de Mudanças nas Configurações
 List<String> logMudancasUmidade = [];
 List<String> logMudancasLuz = [];
 
-// Dados simulados para os Gráficos de Histórico
-List<FlSpot> historicoUmidade = [];
-List<FlSpot> historicoLuz = [];
-List<FlSpot> pontosDeAlerta = [];
-
-// CONFIGURAÇÃO DE NOTIFICAÇÕES
+// NOTIFICAÇÕES
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
     FlutterLocalNotificationsPlugin();
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // CONFIGURAÇÃO MANUAL
+  await Firebase.initializeApp(
+    options: const FirebaseOptions(
+      apiKey: 'AIzaSyD9hlnvx9zsbSlVtoKXA_P5JwK3B5QT9WY',
+      appId: '1:726991202664:android:f69f764f6e1e06db304edd',
+      messagingSenderId: '726991202664',
+      projectId: 'hortainteligente-8d7af',
+    ),
+  );
 
   const AndroidInitializationSettings initializationSettingsAndroid =
       AndroidInitializationSettings('@mipmap/ic_launcher');
@@ -76,34 +82,16 @@ class _DashboardPageState extends State<DashboardPage> {
   double luminosidade = 0;
   String connectionStatus = 'Desconectado';
   MqttServerClient? client;
-  DateTime lastNotificationTime =
-      DateTime.now().subtract(const Duration(minutes: 10));
+
+  // Timers separados para cada tipo de alerta não bloquear o outro
+  DateTime lastTimeUmidade = DateTime.now().subtract(const Duration(days: 1));
+  DateTime lastTimeLuz = DateTime.now().subtract(const Duration(days: 1));
 
   @override
   void initState() {
     super.initState();
     setupMqtt();
-    gerarHistoricoFalso();
     requestNotificationPermission();
-  }
-
-  void gerarHistoricoFalso() {
-    // Cria um histórico fake para as últimas horas
-    DateTime now = DateTime.now();
-    Random random = Random();
-    for (int i = 0; i < 20; i++) {
-      // Fake Umidade
-      double valUmidade = 40 + random.nextInt(40).toDouble();
-      historicoUmidade.add(FlSpot(i.toDouble(), valUmidade));
-
-      // Fake Luz [NOVO]
-      double valLuz = random.nextInt(100).toDouble();
-      historicoLuz.add(FlSpot(i.toDouble(), valLuz));
-
-      if (valUmidade < 50) {
-        pontosDeAlerta.add(FlSpot(i.toDouble(), valUmidade));
-      }
-    }
   }
 
   Future<void> requestNotificationPermission() async {
@@ -113,9 +101,24 @@ class _DashboardPageState extends State<DashboardPage> {
         ?.requestNotificationsPermission();
   }
 
-  Future<void> showNotification(String titulo, String corpo) async {
-    if (DateTime.now().difference(lastNotificationTime).inMinutes < 1) return;
-    lastNotificationTime = DateTime.now();
+  // Agora recebe o 'tipo' para checar o timer correto ('umidade' ou 'luz')
+  Future<void> showNotification(
+      String titulo, String corpo, String tipo) async {
+    DateTime agora = DateTime.now();
+    DateTime ultimoEnvio = (tipo == 'umidade') ? lastTimeUmidade : lastTimeLuz;
+
+    // Verifica tempo
+    if (agora.difference(ultimoEnvio).inSeconds <
+        intervaloNotificacaoSegundos) {
+      return;
+    }
+
+    // Atualiza o timer correto
+    if (tipo == 'umidade') {
+      lastTimeUmidade = agora;
+    } else {
+      lastTimeLuz = agora;
+    }
 
     const AndroidNotificationDetails androidPlatformChannelSpecifics =
         AndroidNotificationDetails(
@@ -127,11 +130,11 @@ class _DashboardPageState extends State<DashboardPage> {
       color: Colors.red,
     );
 
-    const NotificationDetails platformChannelSpecifics =
-        NotificationDetails(android: androidPlatformChannelSpecifics);
+    // Usamos IDs diferentes (0 e 1) para que uma notificação não substitua a outra na barra de status
+    int notificationId = (tipo == 'umidade') ? 0 : 1;
 
-    await flutterLocalNotificationsPlugin.show(
-        0, titulo, corpo, platformChannelSpecifics);
+    await flutterLocalNotificationsPlugin.show(notificationId, titulo, corpo,
+        const NotificationDetails(android: androidPlatformChannelSpecifics));
   }
 
   Future<void> setupMqtt() async {
@@ -159,20 +162,14 @@ class _DashboardPageState extends State<DashboardPage> {
 
         if (mounted) {
           setState(() {
-            if (c[0].topic == topicSolo) {
-              umidadeSolo = double.tryParse(pt) ?? 0;
-              // Atualiza gráfico Umidade
-              if (historicoUmidade.length > 20) historicoUmidade.removeAt(0);
-              historicoUmidade
-                  .add(FlSpot(historicoUmidade.length.toDouble(), umidadeSolo));
+            double valorRecebido = double.tryParse(pt) ?? 0;
 
+            if (c[0].topic == topicSolo) {
+              umidadeSolo = valorRecebido;
               checkAlert();
             } else if (c[0].topic == topicLuz) {
-              luminosidade = double.tryParse(pt) ?? 0;
-              // Atualiza gráfico Luz
-              if (historicoLuz.length > 20) historicoLuz.removeAt(0);
-              historicoLuz
-                  .add(FlSpot(historicoLuz.length.toDouble(), luminosidade));
+              luminosidade = valorRecebido;
+              checkAlert();
             }
           });
         }
@@ -181,11 +178,20 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   void checkAlert() {
+    // Verifica Umidade
     if (umidadeSolo < limiteUmidade) {
-      showNotification("ALERTA CRÍTICO!",
-          "Umidade em ${umidadeSolo.toStringAsFixed(1)}%. Regue agora!");
-      pontosDeAlerta
-          .add(FlSpot((historicoUmidade.length - 1).toDouble(), umidadeSolo));
+      showNotification(
+          "ALERTA DE UMIDADE",
+          "Solo seco (${umidadeSolo.toStringAsFixed(0)}%). Regue agora!",
+          'umidade');
+    }
+
+    // Verifica Luz
+    if (luminosidade < limiteLuz) {
+      showNotification(
+          "ALERTA DE LUZ",
+          "Luminosidade baixa (${luminosidade.toStringAsFixed(0)}%). Precisa de sol!",
+          'luz');
     }
   }
 
@@ -249,7 +255,7 @@ class _DashboardPageState extends State<DashboardPage> {
                 child: ElevatedButton.icon(
                   onPressed: abrirHistorico,
                   icon: const Icon(Icons.show_chart),
-                  label: const Text("VER HISTÓRICO E ALERTAS",
+                  label: const Text("VER HISTÓRICO (BANCO DE DADOS)",
                       style: TextStyle(fontSize: 16)),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.green.shade700,
@@ -276,19 +282,16 @@ class _DashboardPageState extends State<DashboardPage> {
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Row(
-                  children: [
-                    Icon(icon, color: color, size: 28),
-                    const SizedBox(width: 10),
-                    Text(title,
-                        style: const TextStyle(
-                            fontSize: 18, fontWeight: FontWeight.bold)),
-                  ],
-                ),
+                Row(children: [
+                  Icon(icon, color: color, size: 28),
+                  const SizedBox(width: 10),
+                  Text(title,
+                      style: const TextStyle(
+                          fontSize: 18, fontWeight: FontWeight.bold))
+                ]),
                 IconButton(
-                  icon: const Icon(Icons.settings, color: Colors.grey),
-                  onPressed: () => abrirConfiguracoes(tipoConfig),
-                )
+                    icon: const Icon(Icons.settings, color: Colors.grey),
+                    onPressed: () => abrirConfiguracoes(tipoConfig))
               ],
             ),
             const SizedBox(height: 10),
@@ -314,16 +317,15 @@ class _DashboardPageState extends State<DashboardPage> {
                           color: Colors.green),
                     ],
                     pointers: <GaugePointer>[
-                      NeedlePointer(value: value, enableAnimation: true),
+                      NeedlePointer(value: value, enableAnimation: true)
                     ],
                     annotations: <GaugeAnnotation>[
                       GaugeAnnotation(
-                        widget: Text('${value.toStringAsFixed(0)}%',
-                            style: const TextStyle(
-                                fontSize: 25, fontWeight: FontWeight.bold)),
-                        angle: 90,
-                        positionFactor: 0.5,
-                      ),
+                          widget: Text('${value.toStringAsFixed(0)}%',
+                              style: const TextStyle(
+                                  fontSize: 25, fontWeight: FontWeight.bold)),
+                          angle: 90,
+                          positionFactor: 0.5)
                     ],
                   ),
                 ],
@@ -339,7 +341,7 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 }
 
-// TELA DE CONFIGURAÇÕES
+// TELA DE CONFIGURAÇÕES --
 class ConfigPage extends StatefulWidget {
   final String tipo;
   const ConfigPage({super.key, required this.tipo});
@@ -380,11 +382,18 @@ class _ConfigPageState extends State<ConfigPage> {
         limiteLuz = _currentValue;
         logMudancasLuz.insert(0, log);
       }
+
+      // Salva apenas LOGS DE CONFIGURAÇÃO, não leituras de sensores
+      FirebaseFirestore.instance.collection('logs_configuracoes').add({
+        'data_hora': Timestamp.now(),
+        'parametro': widget.tipo,
+        'valor_novo': _currentValue,
+        'log_texto': log
+      });
     });
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text("Configuração Salva!")),
-    );
+    ScaffoldMessenger.of(context)
+        .showSnackBar(const SnackBar(content: Text("Configuração Salva!")));
     Navigator.pop(context);
   }
 
@@ -395,9 +404,8 @@ class _ConfigPageState extends State<ConfigPage> {
       body: Padding(
         padding: const EdgeInsets.all(20.0),
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text("Definir Limite Mínimo de Alerta:",
+            const Text("Definir Limite Mínimo:",
                 style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
             const SizedBox(height: 10),
             Row(
@@ -408,44 +416,28 @@ class _ConfigPageState extends State<ConfigPage> {
                         fontWeight: FontWeight.bold,
                         color: Colors.blue)),
                 Expanded(
-                  child: Slider(
-                    value: _currentValue,
-                    min: 0,
-                    max: 100,
-                    divisions: 100,
-                    label: _currentValue.round().toString(),
-                    onChanged: (double value) {
-                      setState(() {
-                        _currentValue = value;
-                      });
-                    },
-                  ),
-                ),
+                    child: Slider(
+                        value: _currentValue,
+                        min: 0,
+                        max: 100,
+                        divisions: 100,
+                        label: _currentValue.round().toString(),
+                        onChanged: (v) => setState(() => _currentValue = v))),
               ],
             ),
-            const SizedBox(height: 20),
             SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
-                  onPressed: _salvar, child: const Text("SALVAR NOVO LIMITE")),
-            ),
+                width: double.infinity,
+                child: ElevatedButton(
+                    onPressed: _salvar, child: const Text("SALVAR"))),
             const Divider(height: 40),
-            const Text("Histórico de Mudanças:",
+            const Text("Histórico Recente (Sessão):",
                 style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 10),
             Expanded(
-              child: _historico.isEmpty
-                  ? const Center(child: Text("Nenhuma alteração feita ainda."))
-                  : ListView.builder(
-                      itemCount: _historico.length,
-                      itemBuilder: (context, index) {
-                        return ListTile(
-                          leading:
-                              const Icon(Icons.history, color: Colors.grey),
-                          title: Text(_historico[index]),
-                        );
-                      },
-                    ),
+              child: ListView.builder(
+                  itemCount: _historico.length,
+                  itemBuilder: (ctx, i) => ListTile(
+                      leading: const Icon(Icons.history),
+                      title: Text(_historico[i]))),
             ),
           ],
         ),
@@ -454,7 +446,7 @@ class _ConfigPageState extends State<ConfigPage> {
   }
 }
 
-// TELA DE GRÁFICOS E HISTÓRICO
+// TELA DE GRÁFICOS
 class HistoricoPage extends StatefulWidget {
   const HistoricoPage({super.key});
 
@@ -463,148 +455,103 @@ class HistoricoPage extends StatefulWidget {
 }
 
 class _HistoricoPageState extends State<HistoricoPage> {
-  String periodo = "24h";
+  final Stream<QuerySnapshot> _historicoStream = FirebaseFirestore.instance
+      .collection('historico_leituras')
+      .orderBy('data_hora', descending: true)
+      .limit(50)
+      .snapshots();
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text("Histórico Completo")),
-      body: SingleChildScrollView(
-        // Scroll para caber os dois gráficos
-        child: Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              // Filtros
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
+      appBar: AppBar(title: const Text("Histórico do Banco")),
+      body: StreamBuilder<QuerySnapshot>(
+        stream: _historicoStream,
+        builder: (BuildContext context, AsyncSnapshot<QuerySnapshot> snapshot) {
+          if (snapshot.hasError)
+            return const Center(child: Text('Erro ao carregar dados'));
+          if (snapshot.connectionState == ConnectionState.waiting)
+            return const Center(child: CircularProgressIndicator());
+
+          if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+            return const Center(
+                child: Text('Nenhum dado salvo no histórico ainda.'));
+          }
+
+          List<FlSpot> pontosUmidade = [];
+          List<FlSpot> pontosLuz = [];
+
+          final docs = snapshot.data!.docs;
+
+          for (int i = 0; i < docs.length; i++) {
+            var data = docs[i].data() as Map<String, dynamic>;
+            double yUmidade = (data['umidade_solo'] ?? 0).toDouble();
+            double yLuz = (data['luminosidade'] ?? 0).toDouble();
+            double x = (docs.length - 1 - i).toDouble();
+
+            pontosUmidade.add(FlSpot(x, yUmidade));
+            pontosLuz.add(FlSpot(x, yLuz));
+          }
+
+          return SingleChildScrollView(
+            child: Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
                 children: [
-                  _buildFilterBtn("1h"),
-                  const SizedBox(width: 10),
-                  _buildFilterBtn("24h"),
-                  const SizedBox(width: 10),
-                  _buildFilterBtn("7 Dias"),
+                  const Text("Umidade do Solo (%)",
+                      style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.blue)),
+                  const SizedBox(height: 10),
+                  _buildChart(pontosUmidade, Colors.blue),
+                  const SizedBox(height: 30),
+                  const Text("Luminosidade (%)",
+                      style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.orange)),
+                  const SizedBox(height: 10),
+                  _buildChart(pontosLuz, Colors.orange),
                 ],
               ),
-              const SizedBox(height: 20),
-
-              // GRÁFICO 1:
-              const Text("Umidade do Solo (%)",
-                  style: TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.blue)),
-              const SizedBox(height: 10),
-
-              Container(
-                height: 250,
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(15),
-                    boxShadow: [
-                      BoxShadow(blurRadius: 5, color: Colors.black12)
-                    ]),
-                child: LineChart(
-                  LineChartData(
-                    minY: 0,
-                    maxY: 100,
-                    gridData: const FlGridData(show: true),
-                    titlesData: const FlTitlesData(
-                      rightTitles:
-                          AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                      topTitles:
-                          AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                    ),
-                    lineBarsData: [
-                      LineChartBarData(
-                        spots: historicoUmidade,
-                        isCurved: true,
-                        color: Colors.blue,
-                        barWidth: 3,
-                        dotData: const FlDotData(show: false),
-                        belowBarData: BarAreaData(
-                            show: true, color: Colors.blue.withOpacity(0.2)),
-                      ),
-                      LineChartBarData(
-                        spots: pontosDeAlerta,
-                        color: Colors.red,
-                        barWidth: 0,
-                        dotData: FlDotData(
-                          show: true,
-                          getDotPainter: (spot, percent, barData, index) =>
-                              FlDotCirclePainter(
-                                  radius: 6, color: Colors.red, strokeWidth: 0),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-
-              const SizedBox(height: 30),
-
-              //GRÁFICO 2:
-              const Text("Luminosidade (%)",
-                  style: TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.orange)),
-              const SizedBox(height: 10),
-
-              Container(
-                height: 250,
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(15),
-                    boxShadow: [
-                      BoxShadow(blurRadius: 5, color: Colors.black12)
-                    ]),
-                child: LineChart(
-                  LineChartData(
-                    minY: 0,
-                    maxY: 100,
-                    gridData: const FlGridData(show: true),
-                    titlesData: const FlTitlesData(
-                      rightTitles:
-                          AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                      topTitles:
-                          AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                    ),
-                    lineBarsData: [
-                      LineChartBarData(
-                        spots: historicoLuz,
-                        isCurved: true,
-                        color: Colors.orange,
-                        barWidth: 3,
-                        dotData: const FlDotData(show: false),
-                        belowBarData: BarAreaData(
-                            show: true, color: Colors.orange.withOpacity(0.2)),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-
-              const SizedBox(height: 20),
-            ],
-          ),
-        ),
+            ),
+          );
+        },
       ),
     );
   }
 
-  Widget _buildFilterBtn(String label) {
-    bool isSelected = periodo == label;
-    return ElevatedButton(
-      onPressed: () => setState(() => periodo = label),
-      style: ElevatedButton.styleFrom(
-        backgroundColor: isSelected ? Colors.green : Colors.grey[300],
-        foregroundColor: isSelected ? Colors.white : Colors.black,
+  Widget _buildChart(List<FlSpot> pontos, Color cor) {
+    return Container(
+      height: 250,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(15),
+          boxShadow: [const BoxShadow(blurRadius: 5, color: Colors.black12)]),
+      child: LineChart(
+        LineChartData(
+          minY: 0,
+          maxY: 100,
+          gridData: const FlGridData(show: true),
+          titlesData: const FlTitlesData(
+            rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+            topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+          ),
+          lineBarsData: [
+            LineChartBarData(
+              spots: pontos,
+              isCurved: true,
+              color: cor,
+              barWidth: 3,
+              dotData: const FlDotData(show: true),
+              belowBarData:
+                  BarAreaData(show: true, color: cor.withOpacity(0.2)),
+            ),
+          ],
+        ),
       ),
-      child: Text(label),
     );
   }
 }
